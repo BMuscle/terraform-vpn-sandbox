@@ -73,6 +73,23 @@ variable "endpoint_private_ips" {
   }
 }
 
+variable "relay_proxy_private_ips" {
+  description = "fixed private IP addresses for relay proxy EC2 instances"
+  type        = map(string)
+  default = {
+    relay_a = "10.0.10.7"
+    relay_b = "10.0.10.39"
+  }
+
+  validation {
+    condition = alltrue([
+      contains(keys(var.relay_proxy_private_ips), "relay_a"),
+      contains(keys(var.relay_proxy_private_ips), "relay_b"),
+    ])
+    error_message = "relay_proxy_private_ips must include relay_a and relay_b keys."
+  }
+}
+
 variable "relay_vgw_asns" {
   description = "amazon side ASN for relay VGWs"
   type        = map(number)
@@ -98,6 +115,17 @@ variable "private_dns_name" {
   validation {
     condition     = can(regex("^[A-Za-z0-9.-]+$", var.private_dns_name))
     error_message = "private_dns_name must be a valid DNS name."
+  }
+}
+
+variable "site_to_service_domain" {
+  description = "domain name used by site side HTTP access to service via relay proxy"
+  type        = string
+  default     = "svc.vpn.bmuscle.net"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9.-]+$", var.site_to_service_domain))
+    error_message = "site_to_service_domain must be a valid DNS name."
   }
 }
 

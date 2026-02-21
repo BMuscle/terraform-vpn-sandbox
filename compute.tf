@@ -45,9 +45,11 @@ resource "aws_instance" "service_web" {
 resource "aws_instance" "site_web" {
   for_each = local.site_keys
 
-  ami                         = data.aws_ami.amazon_linux_arm64.id
-  instance_type               = var.instance_type
-  subnet_id                   = aws_subnet.main[each.key].id
+  ami           = data.aws_ami.amazon_linux_arm64.id
+  instance_type = var.instance_type
+  subnet_id     = aws_subnet.main[each.key].id
+  # 中継プロキシからの逆方向通信先を固定化するため、拠点WebのIPを固定する。
+  private_ip                  = cidrhost(var.site_vpc_cidr, 10)
   vpc_security_group_ids      = [aws_security_group.site_web[each.key].id]
   associate_public_ip_address = true
 
@@ -65,6 +67,35 @@ resource "aws_instance" "site_web" {
 
   tags = merge(local.tags, {
     Name = "${var.name}-${each.key}-web"
+  })
+}
+
+resource "aws_instance" "relay_proxy" {
+  for_each = local.relay_keys
+
+  ami                    = data.aws_ami.amazon_linux_arm64.id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.main[each.key].id
+  private_ip             = var.relay_proxy_private_ips[each.key]
+  vpc_security_group_ids = [aws_security_group.relay_proxy[each.key].id]
+  # パッケージ導入のため外向きインターネットを使えるようにする。
+  # 受信はSGで site/service CIDR のみ許可し、インターネット公開はしない。
+  associate_public_ip_address = true
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  root_block_device {
+    volume_size           = var.root_volume_size_gb
+    volume_type           = "gp3"
+    encrypted             = true
+    delete_on_termination = true
+  }
+
+  tags = merge(local.tags, {
+    Name = "${var.name}-${each.key}-proxy"
   })
 }
 
@@ -108,7 +139,7 @@ resource "aws_eip" "site_vpn_router" {
 }
 
 resource "aws_ec2_instance_connect_endpoint" "this" {
-  for_each = toset(["service", "site_a", "site_b"])
+  for_each = local.eic_keys
 
   subnet_id          = aws_subnet.main[each.key].id
   security_group_ids = [aws_security_group.eic[each.key].id]
