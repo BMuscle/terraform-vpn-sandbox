@@ -1,0 +1,4 @@
+interface:
+  display_name: "Terraform VPN Sandbox"
+  short_description: "VPN検証環境のTerraform実装と運用改善を支援"
+  default_prompt: "Use $terraform-vpn-sandbox to update Terraform code in this repository with safe make plan/apply workflow."

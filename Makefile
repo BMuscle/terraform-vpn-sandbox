@@ -1,7 +1,7 @@
 env ?= ""
 
 init: guard-env fmt
-	terraform init -backend-config="path=states/${env}.tfstate" -reconfigure
+	terraform init -backend-config=backends/${env}.tfbackend -reconfigure
 
 plan: tf-plan
 
