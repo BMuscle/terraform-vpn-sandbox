@@ -40,14 +40,14 @@ resource "aws_route53_resolver_endpoint" "relay_inbound" {
   direction          = "INBOUND"
   security_group_ids = [aws_security_group.relay_resolver_inbound[each.key].id]
 
-  # 単一AZ前提でも、Resolver Endpointは2つのIPアドレス指定が必要。
+  # マルチAZで片系障害を吸収できるよう、2つのIPを別サブネット（別AZ）に配置する。
   ip_address {
     subnet_id = aws_subnet.main[each.key].id
     ip        = var.relay_inbound_resolver_ips[each.key][0]
   }
 
   ip_address {
-    subnet_id = aws_subnet.main[each.key].id
+    subnet_id = aws_subnet.relay_secondary[each.key].id
     ip        = var.relay_inbound_resolver_ips[each.key][1]
   }
 

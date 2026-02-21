@@ -26,22 +26,53 @@ resource "aws_security_group" "eic" {
   })
 }
 
+resource "aws_security_group" "service_alb" {
+  name        = "${var.name}-service-alb-sg"
+  description = "security group for internal service ALB"
+  vpc_id      = aws_vpc.this["service"].id
+
+  ingress {
+    # PrivateLink EndpointからNLB経由で到達するため、サービスVPC内からの到達を許可する。
+    description = "allow HTTP from service network"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.service_vpc_cidr]
+  }
+
+  ingress {
+    description = "allow HTTPS from service network"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.service_vpc_cidr]
+  }
+
+  egress {
+    description = "allow HTTP to service web"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.service_vpc_cidr]
+  }
+
+  tags = merge(local.tags, {
+    Name = "${var.name}-service-alb-sg"
+  })
+}
+
 resource "aws_security_group" "service_web" {
   name        = "${var.name}-service-web-sg"
   description = "security group for service web EC2"
   vpc_id      = aws_vpc.this["service"].id
 
   ingress {
-    # PrivateLink経由の通信元は中継VPC内ENIのIPになるため、中継CIDRを許可する。
-    description = "allow HTTP from service and relay networks"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = [
-      var.service_vpc_cidr,
-      var.relay_vpc_cidrs["relay_a"],
-      var.relay_vpc_cidrs["relay_b"],
-    ]
+    # サービスEC2はALB配下に限定し、直接の中継CIDR許可を持たない。
+    description     = "allow HTTP from internal service ALB"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.service_alb.id]
   }
 
   ingress {
@@ -223,6 +254,14 @@ resource "aws_security_group" "relay_endpoint" {
     description = "allow HTTP from site network through VPN"
     from_port   = 80
     to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.site_vpc_cidr]
+  }
+
+  ingress {
+    description = "allow HTTPS from site network through VPN"
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = [var.site_vpc_cidr]
   }

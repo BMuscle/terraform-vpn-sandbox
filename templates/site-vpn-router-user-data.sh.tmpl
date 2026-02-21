@@ -1,0 +1,14 @@
+#!/bin/bash
+set -euo pipefail
+
+%{ if bootstrap_enabled ~}
+dnf install -y libreswan
+
+cat >/etc/sysctl.d/99-vpn-router.conf <<'SYSCTL_CONF'
+net.ipv4.ip_forward=1
+SYSCTL_CONF
+
+sysctl --system
+%{ else ~}
+echo "site vpn router bootstrap skipped" >/var/log/site-vpn-router-bootstrap.log
+%{ endif ~}

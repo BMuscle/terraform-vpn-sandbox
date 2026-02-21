@@ -1,8 +1,5 @@
 locals {
-  endpoint_service_private_dns_configuration = try(
-    one(aws_vpc_endpoint_service.service.private_dns_name_configuration),
-    null
-  )
+  endpoint_service_private_dns_configuration = one(aws_vpc_endpoint_service.service.private_dns_name_configuration)
 }
 
 data "aws_route53_zone" "parent_public" {
@@ -28,8 +25,6 @@ resource "aws_route53_record" "delegation_ns" {
 
 resource "aws_route53_record" "endpoint_service_private_dns_verification" {
   # private_dns_nameの所有検証は、委任先の子ゾーン側にTXTを作成する。
-  count = local.endpoint_service_private_dns_configuration == null ? 0 : 1
-
   zone_id = aws_route53_zone.delegated_private_dns.zone_id
   name    = local.endpoint_service_private_dns_configuration.name
   type    = local.endpoint_service_private_dns_configuration.type
@@ -38,8 +33,6 @@ resource "aws_route53_record" "endpoint_service_private_dns_verification" {
 }
 
 resource "aws_vpc_endpoint_service_private_dns_verification" "service" {
-  count = local.endpoint_service_private_dns_configuration == null ? 0 : 1
-
   service_id = aws_vpc_endpoint_service.service.id
 
   depends_on = [
