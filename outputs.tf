@@ -42,3 +42,27 @@ output "ec2_instance_connect_endpoint_ids" {
   description = "EC2 Instance Connect Endpoint ids"
   value       = { for key, value in aws_ec2_instance_connect_endpoint.this : key => value.id }
 }
+
+output "relay_inbound_resolver_endpoint_ids" {
+  description = "inbound resolver endpoint ids in relay VPCs"
+  value       = { for key, value in aws_route53_resolver_endpoint.relay_inbound : key => value.id }
+}
+
+output "relay_inbound_resolver_ips" {
+  description = "fixed inbound resolver IPs in relay VPCs"
+  value       = var.relay_inbound_resolver_ips
+}
+
+output "delegated_public_zone_name_servers" {
+  description = "name servers of delegated public zone for private DNS name"
+  value       = aws_route53_zone.delegated_private_dns.name_servers
+}
+
+output "private_dns_name_verification_record" {
+  description = "TXT record information for endpoint service private DNS verification"
+  value = local.endpoint_service_private_dns_configuration == null ? null : {
+    name  = local.endpoint_service_private_dns_configuration.name
+    type  = local.endpoint_service_private_dns_configuration.type
+    value = local.endpoint_service_private_dns_configuration.value
+  }
+}

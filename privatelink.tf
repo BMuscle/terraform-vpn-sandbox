@@ -46,6 +46,7 @@ resource "aws_lb_listener" "service_http" {
 }
 
 resource "aws_vpc_endpoint_service" "service" {
+  private_dns_name           = var.private_dns_name
   acceptance_required        = false
   network_load_balancer_arns = [aws_lb.service.arn]
 
@@ -69,8 +70,7 @@ resource "aws_vpc_endpoint" "relay" {
   # SubnetConfigurations利用時でも、API互換のためSubnetIdsを明示しておく。
   subnet_ids = [aws_subnet.main[each.key].id]
 
-  # Endpoint Serviceでprivate DNSを持たないため、ここでもDNS連携を無効化する。
-  private_dns_enabled = false
+  private_dns_enabled = var.enable_vpce_private_dns && local.endpoint_service_private_dns_configuration != null
   security_group_ids  = [aws_security_group.relay_endpoint[each.key].id]
 
   subnet_configuration {
@@ -82,4 +82,9 @@ resource "aws_vpc_endpoint" "relay" {
   tags = merge(local.tags, {
     Name = "${var.name}-${each.key}-service-endpoint"
   })
+
+  depends_on = [
+    aws_route53_record.delegation_ns,
+    aws_vpc_endpoint_service_private_dns_verification.service,
+  ]
 }

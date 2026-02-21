@@ -36,6 +36,73 @@
 - Nginxのインストール/設定は手動
 - 拠点VPNルータ（Libreswan等）の設定は手動
 
+## Route53委任 + Inbound Resolver設定
+
+この構成では `private_dns_name`（例: `vpn.bmuscle.net`）を使ってPrivateLinkへ接続します。
+
+- 親ゾーン: `bmuscle.net`
+- 子ゾーン: `vpn.bmuscle.net`（Terraformで作成し、親ゾーンにNS委任）
+- 中継VPC: Route53 Resolver Inbound Endpointを作成
+
+適用後に以下を確認します。
+
+```bash
+terraform output delegated_public_zone_name_servers
+terraform output private_dns_name_verification_record
+terraform output relay_inbound_resolver_ips
+```
+
+補足:
+- 所有検証TXTは子ゾーン（`vpn.bmuscle.net`）に作成されます。
+- `aws_vpc_endpoint_service_private_dns_verification` により、Endpoint Service側の`private_dns_name`検証を完了させます。
+- `enable_vpce_private_dns` は段階的に切り替えます（初期は `false`）。
+
+適用手順（推奨）:
+
+1. 初回適用（検証レコード作成と検証完了待ち）
+
+```bash
+make apply env=dev
+```
+
+2. `vars/dev.tfvars` で `enable_vpce_private_dns = true` を設定
+3. 再度適用（VPCE側private DNS有効化）
+
+```bash
+make apply env=dev
+```
+
+## 拠点側DNS設定（/etc/resolv.conf）
+
+拠点VPCは `enable_dns_support=false` のため、拠点EC2で参照先DNSを明示します。
+
+site_a（中継Aを参照）の例:
+
+```bash
+sudo cp /etc/resolv.conf /etc/resolv.conf.bak
+sudo tee /etc/resolv.conf >/dev/null <<EOF
+nameserver 10.0.10.5
+nameserver 10.0.10.6
+EOF
+```
+
+site_b（中継Bを参照）の例:
+
+```bash
+sudo cp /etc/resolv.conf /etc/resolv.conf.bak
+sudo tee /etc/resolv.conf >/dev/null <<EOF
+nameserver 10.0.10.37
+nameserver 10.0.10.38
+EOF
+```
+
+確認:
+
+```bash
+nslookup vpn.bmuscle.net
+curl -I http://vpn.bmuscle.net
+```
+
 ## Nginx設定手順（WebサーバーEC2へSSH接続後）
 
 この手順はサービスVPCのWeb EC2、拠点VPCのWeb EC2のどちらでも同じです。
@@ -240,10 +307,15 @@ No modules.
 | [aws_route.default_to_igw](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route) | resource |
 | [aws_route.relay_to_site](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route) | resource |
 | [aws_route.site_to_relay](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route) | resource |
+| [aws_route53_record.delegation_ns](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record) | resource |
+| [aws_route53_record.endpoint_service_private_dns_verification](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record) | resource |
+| [aws_route53_resolver_endpoint.relay_inbound](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_resolver_endpoint) | resource |
+| [aws_route53_zone.delegated_private_dns](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_zone) | resource |
 | [aws_route_table.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route_table) | resource |
 | [aws_route_table_association.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route_table_association) | resource |
 | [aws_security_group.eic](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
 | [aws_security_group.relay_endpoint](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
+| [aws_security_group.relay_resolver_inbound](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
 | [aws_security_group.service_web](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
 | [aws_security_group.site_vpn_router](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
 | [aws_security_group.site_web](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
@@ -252,10 +324,12 @@ No modules.
 | [aws_vpc_endpoint.relay](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_endpoint) | resource |
 | [aws_vpc_endpoint_service.service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_endpoint_service) | resource |
 | [aws_vpc_endpoint_service_allowed_principal.same_account](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_endpoint_service_allowed_principal) | resource |
+| [aws_vpc_endpoint_service_private_dns_verification.service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_endpoint_service_private_dns_verification) | resource |
 | [aws_vpn_connection.site_to_relay](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpn_connection) | resource |
 | [aws_vpn_connection_route.site_network](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpn_connection_route) | resource |
 | [aws_vpn_gateway.relay](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpn_gateway) | resource |
 | [aws_ami.amazon_linux_arm64](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/ami) | data source |
+| [aws_route53_zone.parent_public](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/route53_zone) | data source |
 
 ## Inputs
 
@@ -264,10 +338,14 @@ No modules.
 | <a name="input_aws_account_id"></a> [aws\_account\_id](#input\_aws\_account\_id) | AWS account id | `string` | n/a | yes |
 | <a name="input_aws_region"></a> [aws\_region](#input\_aws\_region) | AWS region | `string` | `"ap-northeast-1"` | no |
 | <a name="input_az"></a> [az](#input\_az) | single availability zone | `string` | `"ap-northeast-1a"` | no |
+| <a name="input_enable_vpce_private_dns"></a> [enable\_vpce\_private\_dns](#input\_enable\_vpce\_private\_dns) | enable private DNS on relay interface endpoints after endpoint service private DNS verification | `bool` | `false` | no |
 | <a name="input_endpoint_private_ips"></a> [endpoint\_private\_ips](#input\_endpoint\_private\_ips) | fixed private IP addresses for relay interface endpoints | `map(string)` | <pre>{<br>  "relay_a": "10.0.10.4",<br>  "relay_b": "10.0.10.36"<br>}</pre> | no |
 | <a name="input_env"></a> [env](#input\_env) | environment name | `string` | n/a | yes |
 | <a name="input_instance_type"></a> [instance\_type](#input\_instance\_type) | ec2 instance type for web and vpn instances | `string` | `"t4g.nano"` | no |
 | <a name="input_name"></a> [name](#input\_name) | resource name prefix | `string` | n/a | yes |
+| <a name="input_parent_public_zone_name"></a> [parent\_public\_zone\_name](#input\_parent\_public\_zone\_name) | parent public hosted zone name used for NS delegation | `string` | n/a | yes |
+| <a name="input_private_dns_name"></a> [private\_dns\_name](#input\_private\_dns\_name) | private DNS name for endpoint service | `string` | n/a | yes |
+| <a name="input_relay_inbound_resolver_ips"></a> [relay\_inbound\_resolver\_ips](#input\_relay\_inbound\_resolver\_ips) | fixed IP addresses for inbound resolver endpoints in relay VPCs | `map(list(string))` | <pre>{<br>  "relay_a": [<br>    "10.0.10.5",<br>    "10.0.10.6"<br>  ],<br>  "relay_b": [<br>    "10.0.10.37",<br>    "10.0.10.38"<br>  ]<br>}</pre> | no |
 | <a name="input_relay_vgw_asns"></a> [relay\_vgw\_asns](#input\_relay\_vgw\_asns) | amazon side ASN for relay VGWs | `map(number)` | <pre>{<br>  "relay_a": 64512,<br>  "relay_b": 64513<br>}</pre> | no |
 | <a name="input_relay_vpc_cidrs"></a> [relay\_vpc\_cidrs](#input\_relay\_vpc\_cidrs) | relay vpc cidr blocks | `map(string)` | <pre>{<br>  "relay_a": "10.0.10.0/27",<br>  "relay_b": "10.0.10.32/27"<br>}</pre> | no |
 | <a name="input_root_volume_size_gb"></a> [root\_volume\_size\_gb](#input\_root\_volume\_size\_gb) | root ebs volume size in GB | `number` | `10` | no |
@@ -280,7 +358,11 @@ No modules.
 
 | Name | Description |
 |------|-------------|
+| <a name="output_delegated_public_zone_name_servers"></a> [delegated\_public\_zone\_name\_servers](#output\_delegated\_public\_zone\_name\_servers) | name servers of delegated public zone for private DNS name |
 | <a name="output_ec2_instance_connect_endpoint_ids"></a> [ec2\_instance\_connect\_endpoint\_ids](#output\_ec2\_instance\_connect\_endpoint\_ids) | EC2 Instance Connect Endpoint ids |
+| <a name="output_private_dns_name_verification_record"></a> [private\_dns\_name\_verification\_record](#output\_private\_dns\_name\_verification\_record) | TXT record information for endpoint service private DNS verification |
+| <a name="output_relay_inbound_resolver_endpoint_ids"></a> [relay\_inbound\_resolver\_endpoint\_ids](#output\_relay\_inbound\_resolver\_endpoint\_ids) | inbound resolver endpoint ids in relay VPCs |
+| <a name="output_relay_inbound_resolver_ips"></a> [relay\_inbound\_resolver\_ips](#output\_relay\_inbound\_resolver\_ips) | fixed inbound resolver IPs in relay VPCs |
 | <a name="output_relay_vpc_endpoint_fixed_ips"></a> [relay\_vpc\_endpoint\_fixed\_ips](#output\_relay\_vpc\_endpoint\_fixed\_ips) | fixed private IP addresses for relay interface endpoints |
 | <a name="output_relay_vpc_endpoint_ids"></a> [relay\_vpc\_endpoint\_ids](#output\_relay\_vpc\_endpoint\_ids) | interface endpoint ids in relay VPCs |
 | <a name="output_service_instance_id"></a> [service\_instance\_id](#output\_service\_instance\_id) | service web instance id |
