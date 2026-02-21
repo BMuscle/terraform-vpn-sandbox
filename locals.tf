@@ -53,4 +53,25 @@ locals {
     relay_a = "site_a"
     relay_b = "site_b"
   }
+
+  service_subnet_ids = {
+    primary   = aws_subnet.main["service"].id
+    secondary = aws_subnet.service_alb_secondary.id
+  }
+
+  relay_endpoint_subnet_ids = {
+    for key in local.relay_keys : key => {
+      primary   = aws_subnet.main[key].id
+      secondary = aws_subnet.relay_secondary[key].id
+    }
+  }
+
+  mtls_trust_store_bucket_name = trimsuffix(substr(
+    replace(lower("${var.name}-${var.env}-mtls-trust-${var.aws_account_id}"), "/[^a-z0-9-]/", "-"),
+    0,
+    63
+  ), "-")
+  mtls_ca_bundle_object_key = "trust-store/ca-bundle.pem"
+  site_client_cert_b64      = filebase64(var.site_client_cert_path)
+  site_client_key_b64       = filebase64(var.site_client_key_path)
 }

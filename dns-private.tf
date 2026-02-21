@@ -22,5 +22,5 @@ resource "aws_route53_record" "relay_service_domain_a" {
   name    = trimsuffix(var.site_to_service_domain, ".")
   type    = "A"
   ttl     = 60
-  records = [var.relay_proxy_private_ips[each.key]]
+  records = [aws_instance.relay_proxy[each.key].private_ip]
 }

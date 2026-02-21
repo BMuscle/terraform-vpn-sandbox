@@ -1,0 +1,49 @@
+#!/bin/bash
+set -euo pipefail
+
+install -d -m 755 /etc/pki/mtls
+
+cat <<'CLIENT_CERT_B64' | base64 -d >/etc/pki/mtls/client.crt
+${client_cert_b64}
+CLIENT_CERT_B64
+
+cat <<'CLIENT_KEY_B64' | base64 -d >/etc/pki/mtls/client.key
+${client_key_b64}
+CLIENT_KEY_B64
+
+chmod 644 /etc/pki/mtls/client.crt
+chmod 600 /etc/pki/mtls/client.key
+chown ec2-user:ec2-user /etc/pki/mtls/client.crt /etc/pki/mtls/client.key
+
+%{ if resolv_conf_overwrite ~}
+cp /etc/resolv.conf /etc/resolv.conf.bak
+cat >/etc/resolv.conf <<'RESOLV_CONF'
+nameserver ${resolver_ip_1}
+nameserver ${resolver_ip_2}
+RESOLV_CONF
+%{ endif ~}
+
+mkdir -p /opt/site-http
+cat <<'SITE_HTML_B64' | base64 -d >/opt/site-http/index.html
+${site_web_content_b64}
+SITE_HTML_B64
+
+cat >/etc/systemd/system/site-http.service <<'SITE_HTTP_SERVICE'
+[Unit]
+Description=Simple HTTP server for connectivity checks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m http.server 80 --bind 0.0.0.0 --directory /opt/site-http
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+SITE_HTTP_SERVICE
+
+systemctl daemon-reload
+systemctl enable --now site-http
+curl -I http://127.0.0.1 >/var/log/site-web-bootstrap-curl.log 2>&1 || true

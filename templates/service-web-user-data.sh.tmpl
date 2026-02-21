@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+%{ if bootstrap_enabled ~}
+dnf install -y nginx
+systemctl enable --now nginx
+curl -I http://127.0.0.1 >/var/log/service-web-bootstrap-curl.log 2>&1 || true
+%{ else ~}
+echo "service web bootstrap skipped" >/var/log/service-web-bootstrap.log
+%{ endif ~}

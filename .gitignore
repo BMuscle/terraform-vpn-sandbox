@@ -1,1 +1,5 @@
 .terraform/
+certs/**/*.crt
+certs/**/*.csr
+certs/**/*.key
+certs/**/*.srl
