@@ -13,6 +13,16 @@ output "site_web_instance_ids" {
   value       = { for key, value in aws_instance.site_web : key => value.id }
 }
 
+output "relay_proxy_instance_ids" {
+  description = "relay proxy instance ids"
+  value       = { for key, value in aws_instance.relay_proxy : key => value.id }
+}
+
+output "relay_proxy_private_ips" {
+  description = "fixed private IP addresses for relay proxy instances"
+  value       = var.relay_proxy_private_ips
+}
+
 output "site_vpn_router_instance_ids" {
   description = "site vpn router instance ids"
   value       = { for key, value in aws_instance.site_vpn_router : key => value.id }
@@ -21,6 +31,20 @@ output "site_vpn_router_instance_ids" {
 output "site_vpn_router_public_ips" {
   description = "public ips used by customer gateways"
   value       = { for key, value in aws_eip.site_vpn_router : key => value.public_ip }
+}
+
+output "transit_gateway_id" {
+  description = "transit gateway id for service-relay connectivity"
+  value       = aws_ec2_transit_gateway.main.id
+}
+
+output "transit_gateway_route_table_ids" {
+  description = "transit gateway route table ids"
+  value = {
+    service = aws_ec2_transit_gateway_route_table.service.id
+    relay_a = aws_ec2_transit_gateway_route_table.relay_a.id
+    relay_b = aws_ec2_transit_gateway_route_table.relay_b.id
+  }
 }
 
 output "relay_vpc_endpoint_ids" {
@@ -51,6 +75,11 @@ output "relay_inbound_resolver_endpoint_ids" {
 output "relay_inbound_resolver_ips" {
   description = "fixed inbound resolver IPs in relay VPCs"
   value       = var.relay_inbound_resolver_ips
+}
+
+output "site_to_service_domain" {
+  description = "domain name used by site web EC2 to access service through relay proxy"
+  value       = var.site_to_service_domain
 }
 
 output "delegated_public_zone_name_servers" {

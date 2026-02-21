@@ -1,5 +1,5 @@
 resource "aws_security_group" "eic" {
-  for_each = toset(["service", "site_a", "site_b"])
+  for_each = local.eic_keys
 
   name        = "${var.name}-${each.key}-eic-sg"
   description = "security group for EC2 Instance Connect Endpoint"
@@ -72,11 +72,14 @@ resource "aws_security_group" "site_web" {
   vpc_id      = aws_vpc.this[each.key].id
 
   ingress {
-    description = "allow HTTP from same site network"
+    description = "allow HTTP from same site network and mapped relay network"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = [var.site_vpc_cidr]
+    cidr_blocks = [
+      var.site_vpc_cidr,
+      var.relay_vpc_cidrs[local.site_to_relay[each.key]],
+    ]
   }
 
   ingress {
@@ -96,6 +99,51 @@ resource "aws_security_group" "site_web" {
 
   tags = merge(local.tags, {
     Name = "${var.name}-${each.key}-web-sg"
+  })
+}
+
+resource "aws_security_group" "relay_proxy" {
+  for_each = local.relay_keys
+
+  name        = "${var.name}-${each.key}-proxy-sg"
+  description = "security group for relay proxy EC2"
+  vpc_id      = aws_vpc.this[each.key].id
+
+  ingress {
+    # 拠点 -> サービス方向: 拠点Webから中継プロキシへHTTPを受ける。
+    description = "allow HTTP from site network"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.site_vpc_cidr]
+  }
+
+  ingress {
+    # サービス -> 拠点方向: サービスWebから中継プロキシ固定IPへHTTPを受ける。
+    description = "allow HTTP from service network"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.service_vpc_cidr]
+  }
+
+  ingress {
+    description     = "allow SSH via EIC endpoint"
+    from_port       = 22
+    to_port         = 22
+    protocol        = "tcp"
+    security_groups = [aws_security_group.eic[each.key].id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.tags, {
+    Name = "${var.name}-${each.key}-proxy-sg"
   })
 }
 

@@ -8,14 +8,16 @@ locals {
       enable_dns_hostnames = true
     }
     relay_a = {
-      cidr                 = var.relay_vpc_cidrs["relay_a"]
-      igw                  = false
+      cidr = var.relay_vpc_cidrs["relay_a"]
+      # 中継Proxyでdnf導入を可能にするため、IGW配下のPublic Subnetとして扱う。
+      igw                  = true
       enable_dns_support   = true
       enable_dns_hostnames = true
     }
     relay_b = {
-      cidr                 = var.relay_vpc_cidrs["relay_b"]
-      igw                  = false
+      cidr = var.relay_vpc_cidrs["relay_b"]
+      # 中継Proxyでdnf導入を可能にするため、IGW配下のPublic Subnetとして扱う。
+      igw                  = true
       enable_dns_support   = true
       enable_dns_hostnames = true
     }
@@ -37,6 +39,8 @@ locals {
 
   relay_keys = toset(["relay_a", "relay_b"])
   site_keys  = toset(["site_a", "site_b"])
+  eic_keys   = setunion(toset(["service"]), local.relay_keys, local.site_keys)
+  tgw_keys   = setunion(toset(["service"]), local.relay_keys)
 
   # 拠点A/Bと中継A/Bを1:1で固定マッピングする。
   site_to_relay = {

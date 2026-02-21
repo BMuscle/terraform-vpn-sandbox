@@ -8,7 +8,7 @@
 - サービス側: サービスVPC 1つ + 中継VPC 2つ
 - 拠点側: 拠点VPC 2つ（CIDR重複）
 - 拠点 -> 中継: Site-to-Site VPN（中継VGW、拠点CGW）
-- 中継 -> サービス: PrivateLink（NLB + Endpoint Service + Interface Endpoint）
+- 中継 -> サービス: TGW（メイン経路）+ PrivateLink（併用検証）
 
 ## ネットワーク構成
 
@@ -19,17 +19,23 @@
 - 固定Endpoint IP:
   - 中継A: `10.0.10.4`
   - 中継B: `10.0.10.36`
+- 固定中継Proxy IP:
+  - 中継A: `10.0.10.7`
+  - 中継B: `10.0.10.39`
 
 ## 構築対象
 
-- Amazon Linux 2023 + `t4g.nano` + `gp3 10GB` のEC2（サービス/拠点/拠点VPNルータ）
+- Amazon Linux 2023 + `t4g.nano` + `gp3 10GB` のEC2（サービス/拠点/中継プロキシ/拠点VPNルータ）
 - サービスVPC内のInternal NLB（TCP/80）
 - PrivateLink Endpoint Service
 - 中継VPC内のInterface VPC Endpoint（固定IP指定）
+- TGW（service/relay_a/relay_b接続）
 - 中継VPCごとのVGW
 - 拠点ごとのCGW（拠点VPNルータEC2のEIPを利用）
 - 拠点ごとのSite-to-Site VPN接続
-- EC2 Instance Connect Endpoint（サービスVPC/拠点VPC）
+- Route53 Resolver Inbound Endpoint（中継VPC）
+- Route53 Private Hosted Zone（`svc.vpn.bmuscle.net` を中継VPCごとに作成）
+- EC2 Instance Connect Endpoint（サービスVPC/中継VPC/拠点VPC）
 
 ## 手動作業
 
@@ -38,11 +44,15 @@
 
 ## Route53委任 + Inbound Resolver設定
 
-この構成では `private_dns_name`（例: `vpn.bmuscle.net`）を使ってPrivateLinkへ接続します。
+この構成では以下の2種類の名前解決を併用します。
+
+- `vpn.bmuscle.net`: PrivateLink（Endpoint Service private DNS）
+- `svc.vpn.bmuscle.net`: TGW + 中継Nginxプロキシ経路（拠点 -> サービス）
 
 - 親ゾーン: `bmuscle.net`
 - 子ゾーン: `vpn.bmuscle.net`（Terraformで作成し、親ゾーンにNS委任）
 - 中継VPC: Route53 Resolver Inbound Endpointを作成
+- 中継VPC: `svc.vpn.bmuscle.net` のPrivate Hosted Zoneを中継ごとに作成
 
 適用後に以下を確認します。
 
@@ -50,6 +60,8 @@
 terraform output delegated_public_zone_name_servers
 terraform output private_dns_name_verification_record
 terraform output relay_inbound_resolver_ips
+terraform output relay_proxy_private_ips
+terraform output site_to_service_domain
 ```
 
 補足:
@@ -99,13 +111,18 @@ EOF
 確認:
 
 ```bash
+# TGW + 中継Proxy向け名前解決
+nslookup svc.vpn.bmuscle.net
+
+# PrivateLink向け名前解決
 nslookup vpn.bmuscle.net
-curl -I http://vpn.bmuscle.net
 ```
 
-## Nginx設定手順（WebサーバーEC2へSSH接続後）
+## Nginx設定手順（EC2へSSH接続後）
 
-この手順はサービスVPCのWeb EC2、拠点VPCのWeb EC2のどちらでも同じです。
+### 1. サービスWeb（Nginx）
+
+サービスVPCのWeb EC2で実施します。
 
 1. Nginxをインストール
 
@@ -128,19 +145,132 @@ curl -I http://127.0.0.1
 
 `HTTP/1.1 200 OK` が返れば、デフォルトページ配信まで完了です。
 
-4. リモート疎通確認
+### 2. 拠点Web（パッケージ導入なしで80番応答）
+
+拠点VPCのWeb EC2（`site_a`/`site_b`）で、標準搭載のPythonのみを使って80番応答を起動します。
+
+1. コンテンツを配置
 
 ```bash
-# site_a拠点から service への確認
-curl -I http://10.0.10.4
+sudo mkdir -p /opt/site-http
+cat <<'EOF' | sudo tee /opt/site-http/index.html >/dev/null
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>site web</title></head>
+  <body>
+    <h1>site web</h1>
+    <p>served by python http.server on port 80</p>
+  </body>
+</html>
+EOF
+```
 
-# site_b拠点から service への確認
-curl -I http://10.0.10.36
+2. systemdサービスを作成して起動
+
+```bash
+cat <<'EOF' | sudo tee /etc/systemd/system/site-http.service >/dev/null
+[Unit]
+Description=Simple HTTP server for connectivity checks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m http.server 80 --bind 0.0.0.0 --directory /opt/site-http
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now site-http
+sudo systemctl status site-http --no-pager
+curl -I http://127.0.0.1
+```
+
+### 3. 中継Proxy（relay_a / relay_b）
+
+relay_aとrelay_bのプロキシEC2で実施します。
+（Terraform側で中継VPCはIGW配下のPublic Subnet化し、relay proxyにPublic IPを付与しています）
+
+1. Nginxをインストール
+
+```bash
+sudo dnf install -y nginx
+```
+
+2. プロキシ設定を作成
+
+```bash
+sudo tee /etc/nginx/conf.d/relay-proxy.conf >/dev/null <<'EOF'
+server {
+  listen 80;
+  server_name svc.vpn.bmuscle.net;
+
+  location / {
+    # 拠点 -> 中継Proxy -> サービス の経路
+    proxy_pass http://<SERVICE_NLB_DNS_NAME>;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+
+server {
+  listen 80 default_server;
+  server_name _;
+
+  location / {
+    # サービス -> 中継Proxy固定IP -> 拠点Web の経路
+    proxy_pass http://192.168.10.10;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+EOF
+```
+
+`<SERVICE_NLB_DNS_NAME>` は `terraform output service_nlb_dns_name` の値に置き換えてください。
+
+3. Nginxを起動し設定反映
+
+```bash
+sudo nginx -t
+sudo systemctl enable --now nginx
+sudo systemctl restart nginx
+```
+
+### 4. リモート疎通確認
+
+```bash
+# 拠点 -> サービス（ドメインHTTP）
+curl -I http://svc.vpn.bmuscle.net
+
+# サービス -> 拠点（固定IP HTTP。中継Proxy宛て）
+curl -I http://10.0.10.7
+curl -I http://10.0.10.39
 ```
 
 補足:
 - サービスWeb EC2はインターネットからの直接到達を許可していません。
-- 拠点Web EC2のHTTPは同一拠点CIDR（`192.168.10.0/24`）からのみ許可しています。
+- 拠点Web EC2は同一拠点CIDRに加えて、対応する中継CIDRからのHTTPを許可しています。
+- 中継Proxy EC2はdnf導入のためPublic IPを持ちますが、受信はsite/service CIDRのみ許可しています。
+- 中継間（relay_a <-> relay_b）はTGWルートテーブル分離により通信しません。
+
+## 拠点間分離の検証
+
+拠点A/Bは同一CIDRのため、対向拠点へ直接ルーティングできません。中継もTGWで分離しているため、以下の疎通は失敗する想定です。
+
+```bash
+# site_a から relay_b の中継Proxyへ（失敗すること）
+curl --connect-timeout 3 http://10.0.10.39
+
+# site_b から relay_a の中継Proxyへ（失敗すること）
+curl --connect-timeout 3 http://10.0.10.7
+```
 
 ## Libreswan設定手順（拠点VPNルータへSSH接続後）
 
@@ -253,11 +383,11 @@ sudo ipsec trafficstatus
 9. 疎通確認（拠点Webサーバー等から実施）
 
 ```bash
-# site_a側の確認
-curl -I http://10.0.10.4
+# site_a/site_b側の確認（TGW + 中継Proxy経路）
+curl -I http://svc.vpn.bmuscle.net
 
-# site_b側の確認
-curl -I http://10.0.10.36
+# PrivateLink併用確認（必要に応じて）
+curl -I http://vpn.bmuscle.net
 ```
 
 補足:
@@ -295,7 +425,18 @@ No modules.
 |------|------|
 | [aws_customer_gateway.site](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/customer_gateway) | resource |
 | [aws_ec2_instance_connect_endpoint.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_instance_connect_endpoint) | resource |
+| [aws_ec2_transit_gateway.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway) | resource |
+| [aws_ec2_transit_gateway_route.relay_a_to_service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway_route) | resource |
+| [aws_ec2_transit_gateway_route.relay_b_to_service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway_route) | resource |
+| [aws_ec2_transit_gateway_route.service_to_relay_a](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway_route) | resource |
+| [aws_ec2_transit_gateway_route.service_to_relay_b](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway_route) | resource |
+| [aws_ec2_transit_gateway_route_table.relay_a](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway_route_table) | resource |
+| [aws_ec2_transit_gateway_route_table.relay_b](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway_route_table) | resource |
+| [aws_ec2_transit_gateway_route_table.service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway_route_table) | resource |
+| [aws_ec2_transit_gateway_route_table_association.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway_route_table_association) | resource |
+| [aws_ec2_transit_gateway_vpc_attachment.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ec2_transit_gateway_vpc_attachment) | resource |
 | [aws_eip.site_vpn_router](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eip) | resource |
+| [aws_instance.relay_proxy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance) | resource |
 | [aws_instance.service_web](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance) | resource |
 | [aws_instance.site_vpn_router](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance) | resource |
 | [aws_instance.site_web](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance) | resource |
@@ -305,16 +446,21 @@ No modules.
 | [aws_lb_target_group.service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lb_target_group) | resource |
 | [aws_lb_target_group_attachment.service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lb_target_group_attachment) | resource |
 | [aws_route.default_to_igw](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route) | resource |
+| [aws_route.relay_to_service_via_tgw](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route) | resource |
 | [aws_route.relay_to_site](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route) | resource |
+| [aws_route.service_to_relay_via_tgw](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route) | resource |
 | [aws_route.site_to_relay](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route) | resource |
 | [aws_route53_record.delegation_ns](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record) | resource |
 | [aws_route53_record.endpoint_service_private_dns_verification](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record) | resource |
+| [aws_route53_record.relay_service_domain_a](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record) | resource |
 | [aws_route53_resolver_endpoint.relay_inbound](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_resolver_endpoint) | resource |
 | [aws_route53_zone.delegated_private_dns](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_zone) | resource |
+| [aws_route53_zone.relay_service_domain](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_zone) | resource |
 | [aws_route_table.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route_table) | resource |
 | [aws_route_table_association.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route_table_association) | resource |
 | [aws_security_group.eic](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
 | [aws_security_group.relay_endpoint](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
+| [aws_security_group.relay_proxy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
 | [aws_security_group.relay_resolver_inbound](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
 | [aws_security_group.service_web](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
 | [aws_security_group.site_vpn_router](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
@@ -346,11 +492,13 @@ No modules.
 | <a name="input_parent_public_zone_name"></a> [parent\_public\_zone\_name](#input\_parent\_public\_zone\_name) | parent public hosted zone name used for NS delegation | `string` | n/a | yes |
 | <a name="input_private_dns_name"></a> [private\_dns\_name](#input\_private\_dns\_name) | private DNS name for endpoint service | `string` | n/a | yes |
 | <a name="input_relay_inbound_resolver_ips"></a> [relay\_inbound\_resolver\_ips](#input\_relay\_inbound\_resolver\_ips) | fixed IP addresses for inbound resolver endpoints in relay VPCs | `map(list(string))` | <pre>{<br>  "relay_a": [<br>    "10.0.10.5",<br>    "10.0.10.6"<br>  ],<br>  "relay_b": [<br>    "10.0.10.37",<br>    "10.0.10.38"<br>  ]<br>}</pre> | no |
+| <a name="input_relay_proxy_private_ips"></a> [relay\_proxy\_private\_ips](#input\_relay\_proxy\_private\_ips) | fixed private IP addresses for relay proxy EC2 instances | `map(string)` | <pre>{<br>  "relay_a": "10.0.10.7",<br>  "relay_b": "10.0.10.39"<br>}</pre> | no |
 | <a name="input_relay_vgw_asns"></a> [relay\_vgw\_asns](#input\_relay\_vgw\_asns) | amazon side ASN for relay VGWs | `map(number)` | <pre>{<br>  "relay_a": 64512,<br>  "relay_b": 64513<br>}</pre> | no |
 | <a name="input_relay_vpc_cidrs"></a> [relay\_vpc\_cidrs](#input\_relay\_vpc\_cidrs) | relay vpc cidr blocks | `map(string)` | <pre>{<br>  "relay_a": "10.0.10.0/27",<br>  "relay_b": "10.0.10.32/27"<br>}</pre> | no |
 | <a name="input_root_volume_size_gb"></a> [root\_volume\_size\_gb](#input\_root\_volume\_size\_gb) | root ebs volume size in GB | `number` | `10` | no |
 | <a name="input_service_vpc_cidr"></a> [service\_vpc\_cidr](#input\_service\_vpc\_cidr) | service vpc cidr block | `string` | `"10.0.0.0/24"` | no |
 | <a name="input_site_customer_gateway_bgp_asns"></a> [site\_customer\_gateway\_bgp\_asns](#input\_site\_customer\_gateway\_bgp\_asns) | BGP ASNs for site customer gateways | `map(number)` | <pre>{<br>  "site_a": 65010,<br>  "site_b": 65020<br>}</pre> | no |
+| <a name="input_site_to_service_domain"></a> [site\_to\_service\_domain](#input\_site\_to\_service\_domain) | domain name used by site side HTTP access to service via relay proxy | `string` | `"svc.vpn.bmuscle.net"` | no |
 | <a name="input_site_vpc_cidr"></a> [site\_vpc\_cidr](#input\_site\_vpc\_cidr) | site vpc cidr block | `string` | `"192.168.10.0/24"` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | default tags | `map(string)` | `{}` | no |
 
@@ -363,12 +511,17 @@ No modules.
 | <a name="output_private_dns_name_verification_record"></a> [private\_dns\_name\_verification\_record](#output\_private\_dns\_name\_verification\_record) | TXT record information for endpoint service private DNS verification |
 | <a name="output_relay_inbound_resolver_endpoint_ids"></a> [relay\_inbound\_resolver\_endpoint\_ids](#output\_relay\_inbound\_resolver\_endpoint\_ids) | inbound resolver endpoint ids in relay VPCs |
 | <a name="output_relay_inbound_resolver_ips"></a> [relay\_inbound\_resolver\_ips](#output\_relay\_inbound\_resolver\_ips) | fixed inbound resolver IPs in relay VPCs |
+| <a name="output_relay_proxy_instance_ids"></a> [relay\_proxy\_instance\_ids](#output\_relay\_proxy\_instance\_ids) | relay proxy instance ids |
+| <a name="output_relay_proxy_private_ips"></a> [relay\_proxy\_private\_ips](#output\_relay\_proxy\_private\_ips) | fixed private IP addresses for relay proxy instances |
 | <a name="output_relay_vpc_endpoint_fixed_ips"></a> [relay\_vpc\_endpoint\_fixed\_ips](#output\_relay\_vpc\_endpoint\_fixed\_ips) | fixed private IP addresses for relay interface endpoints |
 | <a name="output_relay_vpc_endpoint_ids"></a> [relay\_vpc\_endpoint\_ids](#output\_relay\_vpc\_endpoint\_ids) | interface endpoint ids in relay VPCs |
 | <a name="output_service_instance_id"></a> [service\_instance\_id](#output\_service\_instance\_id) | service web instance id |
 | <a name="output_service_nlb_dns_name"></a> [service\_nlb\_dns\_name](#output\_service\_nlb\_dns\_name) | DNS name of service NLB |
+| <a name="output_site_to_service_domain"></a> [site\_to\_service\_domain](#output\_site\_to\_service\_domain) | domain name used by site web EC2 to access service through relay proxy |
 | <a name="output_site_vpn_router_instance_ids"></a> [site\_vpn\_router\_instance\_ids](#output\_site\_vpn\_router\_instance\_ids) | site vpn router instance ids |
 | <a name="output_site_vpn_router_public_ips"></a> [site\_vpn\_router\_public\_ips](#output\_site\_vpn\_router\_public\_ips) | public ips used by customer gateways |
 | <a name="output_site_web_instance_ids"></a> [site\_web\_instance\_ids](#output\_site\_web\_instance\_ids) | site web instance ids |
+| <a name="output_transit_gateway_id"></a> [transit\_gateway\_id](#output\_transit\_gateway\_id) | transit gateway id for service-relay connectivity |
+| <a name="output_transit_gateway_route_table_ids"></a> [transit\_gateway\_route\_table\_ids](#output\_transit\_gateway\_route\_table\_ids) | transit gateway route table ids |
 | <a name="output_vpn_connection_ids"></a> [vpn\_connection\_ids](#output\_vpn\_connection\_ids) | site to relay vpn connection ids |
 <!-- END_TF_DOCS -->
