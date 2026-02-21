@@ -1,0 +1,3 @@
+bucket = "bmuscle-dev-tfstate"
+key = "vpn-sandbox-dev-aws.tfstate"
+region = "ap-northeast-1"
